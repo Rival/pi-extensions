@@ -1,0 +1,15 @@
+{
+  "name": "pi-extensions",
+  "version": "0.1.0",
+  "description": "Pi coding agent extensions — session header, status line, custom compaction",
+  "type": "module",
+  "author": "Rival",
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./extensions/session-header.ts",
+      "./extensions/statusline.ts",
+      "./extensions/custom-compaction.ts"
+    ]
+  }
+}
