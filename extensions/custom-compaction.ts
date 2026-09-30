@@ -1,17 +1,18 @@
 /**
  * Custom compaction — use a cheaper/faster model for summarization when it fits.
  *
- * Default model: glm-4.7 via the z.ai Anthropic endpoint (reuses your zai-anthropic
- * subscription auth). glm-4.7 has a 200k context window, cheaper/faster than glm-5.2.
+ * Default model: glm-5.3-flash through the LiteLLM gateway (the `litellm` provider
+ * from models.json) — 1M context window, cheap and fast, and the spend lands in
+ * the gateway's per-key accounting (llm-dash) instead of bypassing it.
  *
  * Logic:
  *   - Estimate tokens of the messages being summarized.
- *   - If they fit in glm-4.7's 200k window (minus output budget) → summarize with glm-4.7.
+ *   - If they fit the model's window (minus output budget) → summarize with it.
  *   - If too big → return nothing → pi falls back to its DEFAULT compaction (your main model).
  *
  * Situational overrides via `/compact`:
- *   /compact glm-4.7                → force glm-4.7 for this compaction
- *   /compact glm-4.6 focus on auth  → model + extra instructions
+ *   /compact glm-5.3-flash          → force the default compaction model explicitly
+ *   /compact litellm/glm-5.3 focus on auth → provider/id model + extra instructions
  *   /compact focus on auth          → just instructions, default model selection
  *   /compact google/gemini-2.5-flash→ any registry model (uses its own auth)
  *
@@ -23,31 +24,21 @@
  */
 
 import { complete } from "@earendil-works/pi-ai/compat";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import {
 	convertToLlm,
 	estimateTokens,
 	serializeConversation,
 	type ExtensionAPI,
-	type Model,
 } from "@earendil-works/pi-coding-agent";
 
 // ── config ──────────────────────────────────────────────────────────────────
 
-/** Default compaction model (used when context fits its window). */
-const DEFAULT_MODEL_ID = "glm-4.7";
-
 /**
- * z.ai models routable through the Anthropic endpoint (api.z.ai/api/anthropic),
- * reusing the zai-anthropic subscription auth. id → context window.
- * Add entries here to enable more z.ai models for compaction.
+ * Default compaction model (used when context fits its window). Bare id — must
+ * exist in models.json so the registry resolves id + context window + auth.
  */
-const ZAI_ANTHROPIC_MODELS: Record<string, number> = {
-	"glm-4.7": 204800,
-	"glm-4.6": 204800,
-	"glm-4.5": 131072,
-	"glm-5.1": 200000,
-	"glm-5.2": 1_000_000,
-};
+const DEFAULT_MODEL_ID = "glm-5.3-flash";
 
 /** Output token budget for the summary. */
 const SUMMARY_MAX_TOKENS = 8192;
@@ -133,7 +124,11 @@ const SUMMARIZATION_SYSTEM_PROMPT =
 
 // ── file tracking (mirrors pi's computeFileLists + formatFileOperations) ─────
 
-function computeFileLists(fileOps: { read?: string[]; edited?: string[]; written?: string[] }): {
+function computeFileLists(fileOps: {
+	read?: Iterable<string>;
+	edited?: Iterable<string>;
+	written?: Iterable<string>;
+}): {
 	readFiles: string[];
 	modifiedFiles: string[];
 } {
@@ -154,22 +149,17 @@ function formatFileOperations(readFiles: string[], modifiedFiles: string[]): str
 // ── model resolution ────────────────────────────────────────────────────────
 
 interface ResolvedModel {
-	model: Model;
+	model: Model<Api>;
 	contextWindow: number;
-	/** Auth provider — either the zai-anthropic base (shared) or the model's own. */
-	authSource: Model;
 }
 
 /**
- * Resolve a model spec into something callable.
- *   "glm-4.7"            → z.ai via anthropic endpoint (reuses zai-anthropic auth)
- *   "google/gemini-..."  → registry lookup (own auth)
+ * Resolve a model spec into something callable via the model registry
+ * (models.json / built-ins). Auth always comes from the resolved model itself.
+ *   "glm-5.3-flash"     → bare-id registry lookup
+ *   "litellm/glm-5.3"   → provider/id registry lookup
  */
-function resolveModel(
-	spec: string,
-	registry: { getAll(): Model[] },
-	baseZaiModel: Model | undefined,
-): ResolvedModel | null {
+function resolveModel(spec: string, registry: { getAll(): Model<Api>[] }): ResolvedModel | null {
 	const lower = spec.toLowerCase();
 
 	// provider/id form → registry lookup
@@ -177,23 +167,13 @@ function resolveModel(
 		const [provider, ...rest] = spec.split("/");
 		const id = rest.join("/");
 		const m = registry.getAll().find((x) => x.provider === provider && x.id.toLowerCase() === id.toLowerCase());
-		if (m && m.contextWindow) return { model: m, contextWindow: m.contextWindow, authSource: m };
+		if (m && m.contextWindow) return { model: m, contextWindow: m.contextWindow };
 		return null;
-	}
-
-	// z.ai model via the anthropic endpoint (reuse subscription auth)
-	if (lower in ZAI_ANTHROPIC_MODELS && baseZaiModel) {
-		const ctx = ZAI_ANTHROPIC_MODELS[lower]!;
-		return {
-			model: { ...baseZaiModel, id: spec, name: `${spec} (compaction)`, contextWindow: ctx },
-			contextWindow: ctx,
-			authSource: baseZaiModel,
-		};
 	}
 
 	// bare id → any registry match
 	const m = registry.getAll().find((x) => x.id.toLowerCase() === lower);
-	if (m && m.contextWindow) return { model: m, contextWindow: m.contextWindow, authSource: m };
+	if (m && m.contextWindow) return { model: m, contextWindow: m.contextWindow };
 
 	return null;
 }
@@ -201,15 +181,14 @@ function resolveModel(
 /** Parse "/compact <spec> [instructions]" — returns model + leftover instructions. */
 function parseCompactArg(
 	customInstructions: string | undefined,
-	registry: { getAll(): Model[] },
-	baseZaiModel: Model | undefined,
+	registry: { getAll(): Model<Api>[] },
 ): { modelId: string; instructions: string | undefined } {
 	if (!customInstructions) return { modelId: DEFAULT_MODEL_ID, instructions: undefined };
 	const trimmed = customInstructions.trim();
 	const firstToken = trimmed.split(/\s+/)[0] ?? "";
 
 	// Does the first token resolve to a model?
-	const resolved = resolveModel(firstToken, registry, baseZaiModel);
+	const resolved = resolveModel(firstToken, registry);
 	if (resolved) {
 		const rest = trimmed.slice(firstToken.length).trim();
 		return { modelId: firstToken, instructions: rest || undefined };
@@ -232,21 +211,19 @@ export default function (pi: ExtensionAPI) {
 			fileOps,
 		} = preparation;
 
-		// Base model carrying the z.ai Anthropic endpoint + subscription auth.
-		const baseZaiModel = ctx.modelRegistry.getAll().find((m) => m.provider === "zai-anthropic");
-
-		const { modelId, instructions } = parseCompactArg(customInstructions, ctx.modelRegistry, baseZaiModel);
-		const resolved = resolveModel(modelId, ctx.modelRegistry, baseZaiModel);
+		const { modelId, instructions } = parseCompactArg(customInstructions, ctx.modelRegistry);
+		const resolved = resolveModel(modelId, ctx.modelRegistry);
 		if (!resolved) {
 			ctx.ui.notify(`Compaction: could not resolve model "${modelId}", using default`, "warning");
 			return; // → pi default
 		}
-		const { model, contextWindow, authSource } = resolved;
+		const { model, contextWindow } = resolved;
 
-		// Auth (reuse zai-anthropic subscription for z.ai models, own auth for others)
-		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(authSource);
+		// Auth from the resolved model itself (LiteLLM virtual key for litellm models,
+		// so compaction spend is tracked by the gateway, not spent alongside it).
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 		if (!auth.ok || !auth.apiKey) {
-			ctx.ui.notify(`Compaction: no auth for ${authSource.provider}, using default`, "warning");
+			ctx.ui.notify(`Compaction: no auth for ${model.provider}/${model.id}, using default`, "warning");
 			return;
 		}
 
