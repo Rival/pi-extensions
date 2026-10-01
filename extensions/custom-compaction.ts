@@ -11,10 +11,14 @@
  *   - If too big → return nothing → pi falls back to its DEFAULT compaction (your main model).
  *
  * Situational overrides via `/compact`:
- *   /compact glm-5.3-flash          → force the default compaction model explicitly
+ *   /compact litellm/glm-5.3-flash  → force the default compaction model
  *   /compact litellm/glm-5.3 focus on auth → provider/id model + extra instructions
  *   /compact focus on auth          → just instructions, default model selection
  *   /compact google/gemini-2.5-flash→ any registry model (uses its own auth)
+ *
+ * NOTE: prefer provider/id specs — bare ids resolve to the FIRST registry match,
+ * and glm-5.3-flash exists under several built-in providers (opencode, zai, radius)
+ * that share the id but not your auth.
  *
  * The summary format mirrors pi's built-in compaction (Goal/Progress/Next Steps +
  * cumulative <read-files>/<modified-files> tracking), so file tracking stays intact.
@@ -35,10 +39,11 @@ import {
 // ── config ──────────────────────────────────────────────────────────────────
 
 /**
- * Default compaction model (used when context fits its window). Bare id — must
- * exist in models.json so the registry resolves id + context window + auth.
+ * Default compaction model (used when context fits its window). Provider-qualified:
+ * bare "glm-5.3-flash" is ambiguous in the registry (opencode/zai/radius copies),
+ * and the first match carries no auth. Must exist in models.json under `litellm`.
  */
-const DEFAULT_MODEL_ID = "glm-5.3-flash";
+const DEFAULT_MODEL_ID = "litellm/glm-5.3-flash";
 
 /** Output token budget for the summary. */
 const SUMMARY_MAX_TOKENS = 8192;
