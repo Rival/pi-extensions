@@ -26,8 +26,9 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { execSync } from "node:child_process";
-import { existsSync, readdirSync, unlinkSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -195,7 +196,48 @@ function capture(device?: string): CaptureResult {
 	}
 }
 
+/** Read a snapshot off disk as a pi image content block (base64 jpeg). */
+function imageBlock(path: string): { type: "image"; data: string; mimeType: "image/jpeg" } | null {
+	try {
+		return { type: "image", data: readFileSync(path).toString("base64"), mimeType: "image/jpeg" };
+	} catch {
+		return null;
+	}
+}
+
 export default function (pi: ExtensionAPI) {
+	// Tool: the AGENT can shoot on demand — result carries the frame inline.
+	pi.registerTool({
+		name: "webcam_snapshot",
+		label: "Webcam Snapshot",
+		description:
+			"Capture a snapshot from the webcam. Returns the JPEG image inline plus its file path. Use when the user asks what the camera sees or to visually check the room/desk/screen.",
+		promptSnippet: "Capture a webcam snapshot and return the frame as an image",
+		promptGuidelines: [
+			"Use webcam_snapshot when the user asks what the camera sees, to check the room, or to look at something physically in front of the desk.",
+		],
+		parameters: Type.Object({
+			device: Type.Optional(
+				Type.String({ description: "V4L2 device path, e.g. /dev/video0. Default: first capture node." }),
+			),
+		}),
+		async execute(_toolCallId, params) {
+			const result = capture(params.device);
+			if (!result.success) {
+				return { content: [{ type: "text", text: `Capture failed: ${result.error}` }], isError: true };
+			}
+			const content: Array<
+				| { type: "text"; text: string }
+				| { type: "image"; data: string; mimeType: "image/jpeg" }
+			> = [{ type: "text", text: `Webcam snapshot: ${result.path}` }];
+			const img = imageBlock(result.path);
+			if (img) content.push(img);
+			return { content, details: { path: result.path } };
+		},
+	});
+
+	// Command: /camera take — deliver the frame into the conversation so the
+	// agent actually receives it (upstream only toasted the path in the UI).
 	pi.registerCommand("camera", {
 		description: "Capture webcam snapshots — /camera take [device] | /camera list",
 		getArgumentCompletions(prefix: string) {
@@ -231,10 +273,26 @@ export default function (pi: ExtensionAPI) {
 			if (action === "take") {
 				const device = parts.slice(1).join(" ") || "";
 				const result = capture(device);
-				if (result.success) {
-					ctx.ui.notify(`Snapshot saved: ${result.path}`, "info");
-				} else {
+				if (!result.success) {
 					ctx.ui.notify(`Capture failed: ${result.error}`, "error");
+					return;
+				}
+				const content: Array<
+					| { type: "text"; text: string }
+					| { type: "image"; data: string; mimeType: "image/jpeg" }
+				> = [{ type: "text", text: `/camera take — webcam snapshot saved to ${result.path}` }];
+				const img = imageBlock(result.path);
+				if (img) content.push(img);
+				try {
+					// Idle: sends immediately and starts a turn — the agent gets the frame.
+					pi.sendUserMessage(content);
+				} catch {
+					// Streaming: needs an explicit mode, else rejected.
+					try {
+						pi.sendUserMessage(content, { deliverAs: "followUp" });
+					} catch {
+						ctx.ui.notify(`Snapshot saved: ${result.path}`, "info");
+					}
 				}
 				return;
 			}
