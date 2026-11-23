@@ -27,6 +27,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { Box, Image, Text } from "@earendil-works/pi-tui";
 import { execSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -206,6 +207,20 @@ function imageBlock(path: string): { type: "image"; data: string; mimeType: "ima
 }
 
 export default function (pi: ExtensionAPI) {
+	// TUI: render snapshots inline in the transcript (user messages with images
+	// don't render in the chat, custom entries with a renderer do).
+	pi.registerEntryRenderer("webcam-snapshot", (entry, _opts, theme) => {
+		const data = entry.data as { base64: string; path: string };
+		const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+		box.addChild(new Text(theme.fg("dim", `📷 ${data.path}`)));
+		box.addChild(
+			new Image(data.base64, "image/jpeg", { fallbackColor: (s) => theme.fg("dim", s) }, {
+				maxWidthCells: 64,
+			}),
+		);
+		return box;
+	});
+
 	// Tool: the AGENT can shoot on demand — result carries the frame inline.
 	pi.registerTool({
 		name: "webcam_snapshot",
@@ -282,7 +297,11 @@ export default function (pi: ExtensionAPI) {
 					| { type: "image"; data: string; mimeType: "image/jpeg" }
 				> = [{ type: "text", text: `/camera take — webcam snapshot saved to ${result.path}` }];
 				const img = imageBlock(result.path);
-				if (img) content.push(img);
+				if (img) {
+					content.push(img);
+					// visible frame in the TUI transcript (kitty graphics via pi-tui)
+					pi.appendEntry("webcam-snapshot", { base64: img.data, path: result.path });
+				}
 				try {
 					// Idle: sends immediately and starts a turn — the agent gets the frame.
 					pi.sendUserMessage(content);
