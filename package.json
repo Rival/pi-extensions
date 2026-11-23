@@ -9,7 +9,8 @@
     "extensions": [
       "./extensions/session-header.ts",
       "./extensions/statusline.ts",
-      "./extensions/custom-compaction.ts"
+      "./extensions/custom-compaction.ts",
+      "./extensions/webcam.ts"
     ]
   }
 }
